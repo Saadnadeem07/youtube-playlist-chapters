@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+playlist_videos.txt
+final_output.txt
+.env
+.idea/
+.vscode/
