@@ -1,4 +1,4 @@
-# YouTube Playlist Chapters Extractor
+# YouTube Playlist Chapters Extractor <img src="https://upload.wikimedia.org/wikipedia/commons/0/09/YouTube_full-color_icon_%282017%29.svg" alt="YouTube" height="28" align="center">
 
 Give it a YouTube playlist URL — get back a single clean text file containing every video's **title, URL, and chapter timestamps**. Useful for feeding learning playlists to LLMs (Claude, ChatGPT, etc.) to plan a watch order, assess topic coverage, or generate a study roadmap.
 
@@ -25,18 +25,28 @@ pip install -r requirements.txt
 
 ## Usage
 
-Run the orchestrator with any YouTube playlist URL:
+`main.py` auto-detects whether you pass a **playlist URL** or a **single video URL**.
+
+### Playlist mode
 
 ```bash
 python main.py "https://www.youtube.com/playlist?list=PLlfy9GnSVerQjeoYfoYKEMS1yKl89NOvL"
 ```
 
-Two files are produced:
+Produces:
 
 | File | Contents |
 |------|----------|
 | `playlist_videos.txt` | Title + URL for every video in the playlist |
 | `final_output.txt`    | Title + URL + chapters for every video (main output) |
+
+### Single video mode
+
+```bash
+python main.py "https://www.youtube.com/watch?v=z0BZDAtQa6E"
+```
+
+Produces `final_output.txt` with just that one video's title, URL, and chapters.
 
 ### Output format
 
