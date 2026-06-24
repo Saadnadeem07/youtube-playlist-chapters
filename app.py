@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-YouTube Playlist Downloader — a tiny, dependency-free local web app.
+YouTube Playlist Toolkit — a tiny, dependency-free local web app.
 
-Paste a playlist (or single video) URL, browse every video, pick a quality, and
-download them all, a selection, or one-by-one — each with a live progress bar.
+Two tools, one server — pick whichever you need:
+
+  • Download  — browse a playlist (or single video), choose a quality, and
+                download videos with live progress, multi-select, and cancel.
+  • Chapters  — pull the chapter timestamps from every video into one clean
+                text file, ready to paste into an LLM (Claude, ChatGPT, …)
+                along with the included analysis prompt.
 
 No third-party Python packages required: this uses only the standard library and
 shells out to the ``yt-dlp`` binary (with ``ffmpeg`` for merging audio + video).
@@ -15,6 +20,7 @@ Usage:
 Downloads are saved to the ./downloads folder next to this script.
 """
 
+import concurrent.futures
 import json
 import os
 import queue
@@ -45,9 +51,48 @@ FORMAT_SELECTORS = {
     "480": "bestvideo[height<=480]+bestaudio/best[height<=480]",
 }
 
-# ---------------------------------------------------------------------------
-# Shared state: a single background worker downloads sequentially from a queue.
-# ---------------------------------------------------------------------------
+# A ready-to-use prompt for analyzing the extracted chapters with an LLM.
+LLM_PROMPT = """I'm sharing a text file containing a YouTube playlist. Each entry has:
+- Video Title
+- Video URL
+- Chapters (timestamps + topics), or "No chapters found"
+- A `----` separator
+
+I want to learn this subject from scratch to an advanced / production-ready level.
+Analyze the chapters of every video and give me:
+
+## 1. Recommended Watch Order
+Reorder the videos from first-to-watch -> last-to-watch based on learning
+dependencies. For each video, in 1-2 lines, explain why it sits at that position
+- what prerequisite knowledge it builds on and what it unlocks next.
+
+## 2. Topic Coverage Assessment
+For each video, based purely on the chapter titles, tell me:
+- Coverage score (0-100%) - comprehensive (beginner -> advanced -> production) or partial?
+- What's covered well
+- What's missing or light
+- Prerequisites the viewer should already know
+- Difficulty: Beginner / Intermediate / Advanced
+
+## 3. Gap Analysis Across the Playlist
+- Which important topics are not covered at all?
+- Which topics are covered by multiple videos (overlap)?
+- Suggest external topics/resources to fill the gaps into a complete roadmap.
+
+## 4. Final Roadmap
+A clean, numbered table: | # | Video Title | Why Now | Coverage % | Difficulty | Est. Hours |
+
+## Rules
+- Do not skip any video - include all of them.
+- If a video has "No chapters found", infer from the title only and mark coverage
+  as "Unknown - title-based guess".
+- Be honest about gaps; don't inflate coverage %.
+- Keep reasoning concise and actionable - I want to start watching today.
+"""
+
+# ===========================================================================
+# Download feature — a single background worker downloads from a queue.
+# ===========================================================================
 _lock = threading.Lock()
 _status = {}          # vid -> {state, percent, speed, eta, file, error, title}
 _meta = {}            # vid -> {"title": ..., "url": ..., "format": ...}
@@ -180,9 +225,83 @@ def worker():
 threading.Thread(target=worker, daemon=True).start()
 
 
-# ---------------------------------------------------------------------------
-# yt-dlp helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Chapters feature — extract chapter timestamps for a set of videos.
+# ===========================================================================
+_ch_lock = threading.Lock()
+_ch = {"state": "idle", "done": 0, "total": 0, "text": "", "error": "", "rows": {}}
+CH_SEP = "-" * 40
+
+
+def format_timestamp(seconds):
+    seconds = int(seconds or 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def fetch_chapters(url):
+    """Return (chapter_text, count) for one video via the yt-dlp binary."""
+    cmd = [YTDLP, "-J", "--no-playlist", "--no-warnings", "--no-color", url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "No chapters found", 0
+    if out.returncode != 0:
+        return "No chapters found", 0
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return "No chapters found", 0
+    chapters = data.get("chapters") or []
+    if not chapters:
+        return "No chapters found", 0
+    lines = [f"{format_timestamp(c.get('start_time', 0))} - {c.get('title', '')}"
+             for c in chapters]
+    return "\n".join(lines), len(chapters)
+
+
+def run_chapters(videos):
+    """Background job: extract chapters for every video, assemble one text file."""
+    results = [None] * len(videos)
+
+    def work(i, v):
+        url = v.get("url") or f"https://www.youtube.com/watch?v={v.get('id')}"
+        text, count = fetch_chapters(url)
+        results[i] = (v, text)
+        with _ch_lock:
+            _ch["done"] += 1
+            _ch["rows"][v.get("id")] = {"count": count}
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futures = [ex.submit(work, i, v) for i, v in enumerate(videos)]
+            for f in concurrent.futures.as_completed(futures):
+                f.result()
+        parts = []
+        for v, text in results:
+            title = v.get("title", "")
+            url = v.get("url", "")
+            parts.append(f"{title}\n{url}\n{text}\n{CH_SEP}\n")
+        with _ch_lock:
+            _ch["text"] = "\n".join(parts)
+            _ch["state"] = "done"
+    except Exception as e:  # noqa: BLE001 — surface any failure to the UI
+        with _ch_lock:
+            _ch["state"] = "error"
+            _ch["error"] = str(e)
+
+
+def start_chapters(videos):
+    with _ch_lock:
+        _ch.update(state="running", done=0, total=len(videos),
+                   text="", error="", rows={})
+    threading.Thread(target=run_chapters, args=(videos,), daemon=True).start()
+
+
+# ===========================================================================
+# yt-dlp helpers shared by both features
+# ===========================================================================
 def list_playlist(url):
     """Return (playlist_title, [video dicts]) using a fast flat extraction."""
     if not url:
@@ -237,16 +356,16 @@ def open_folder():
         subprocess.Popen(["xdg-open", DOWNLOAD_DIR])
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # HTTP layer
-# ---------------------------------------------------------------------------
+# ===========================================================================
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>YouTube Playlist Downloader</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬇️</text></svg>">
+<title>YouTube Playlist Toolkit</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧰</text></svg>">
 <style>
   :root{
     --bg:#0b0d12; --bg-soft:#11141c; --panel:#151926; --panel-2:#1b2030;
@@ -273,6 +392,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   a{ color:var(--brand); }
   .wrap{ max-width:980px; margin:0 auto; padding:0 18px; }
+  .hide{ display:none !important; }
 
   /* Header */
   header{
@@ -284,7 +404,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .logo{ display:flex; align-items:center; gap:10px; font-weight:700; font-size:16px; }
   .logo .mark{
     width:32px; height:32px; border-radius:9px; display:grid; place-items:center;
-    background:linear-gradient(135deg,var(--brand),var(--accent)); color:#fff; font-size:17px;
+    background:linear-gradient(135deg,var(--brand),var(--accent)); color:#fff; font-size:16px;
     box-shadow:0 4px 14px var(--brand-ghost);
   }
   .logo small{ display:block; font-weight:500; color:var(--muted); font-size:11px; }
@@ -298,9 +418,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .ghost-link{ color:var(--muted); text-decoration:none; font-size:13px; padding:0 6px; }
   .ghost-link:hover{ color:var(--text); }
 
+  /* Mode tabs */
+  .tabs{ display:flex; gap:6px; padding:6px; margin:18px 0 0; background:var(--panel);
+    border:1px solid var(--border); border-radius:12px; }
+  .tab{ flex:1; padding:11px; border-radius:9px; border:none; background:transparent;
+    color:var(--muted); font-size:14px; font-weight:600; cursor:pointer; transition:.15s;
+    display:flex; align-items:center; justify-content:center; gap:8px; }
+  .tab:hover{ color:var(--text); transform:none; }
+  .tab.active{ background:linear-gradient(135deg,var(--brand),var(--accent)); color:#fff; }
+  .tab .t-sub{ font-weight:400; font-size:11px; opacity:.85; }
+
   /* Search / load bar */
   .search{
-    display:flex; gap:10px; padding:16px; margin:18px 0; flex-wrap:wrap;
+    display:flex; gap:10px; padding:16px; margin:14px 0; flex-wrap:wrap;
     background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
     box-shadow:var(--shadow);
   }
@@ -329,44 +459,36 @@ INDEX_HTML = r"""<!DOCTYPE html>
   button:disabled{ opacity:.45; cursor:not-allowed; transform:none; }
 
   /* Toolbar */
-  .toolbar{
-    display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px;
-  }
+  .toolbar{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
   .pl-title{ font-size:15px; font-weight:700; }
   .pl-sub{ color:var(--muted); font-size:13px; }
   .chk{ display:inline-flex; align-items:center; gap:7px; color:var(--muted); font-size:13px; cursor:pointer; user-select:none; }
   .chk input{ width:16px; height:16px; accent-color:var(--brand); cursor:pointer; }
-  .mini-search{ min-width:170px; }
+  .mini-search{ min-width:160px; }
   .mini-search input{ height:38px; padding-left:34px; }
 
-  /* Overall progress */
-  .overall{
-    display:none; align-items:center; gap:12px; padding:12px 14px; margin-bottom:14px;
-    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-sm);
-  }
-  .overall.show{ display:flex; }
-  .overall .track{ flex:1; height:8px; border-radius:6px; background:var(--bg-soft); overflow:hidden; }
-  .overall .track > i{ display:block; height:100%; width:0%; border-radius:6px;
+  /* Progress strip */
+  .strip{ display:none; align-items:center; gap:12px; padding:12px 14px; margin-bottom:14px;
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius-sm); }
+  .strip.show{ display:flex; }
+  .strip .track{ flex:1; height:8px; border-radius:6px; background:var(--bg-soft); overflow:hidden; }
+  .strip .track > i{ display:block; height:100%; width:0%; border-radius:6px;
     background:linear-gradient(90deg,var(--brand),var(--accent)); transition:width .4s ease; }
-  .overall .label{ font-size:13px; color:var(--muted); white-space:nowrap; }
+  .strip .label{ font-size:13px; color:var(--muted); white-space:nowrap; }
 
   /* List */
-  #list{ display:flex; flex-direction:column; gap:10px; padding-bottom:60px; }
-  .row{
-    display:flex; gap:14px; align-items:center; padding:12px;
+  #list{ display:flex; flex-direction:column; gap:10px; padding-bottom:20px; }
+  .row{ display:flex; gap:14px; align-items:center; padding:12px;
     border:1px solid var(--border); border-radius:var(--radius); background:var(--panel);
-    transition:.15s; position:relative;
-  }
+    transition:.15s; position:relative; }
   .row:hover{ border-color:color-mix(in srgb, var(--brand) 40%, var(--border)); }
   .row.sel{ border-color:var(--brand); background:color-mix(in srgb, var(--brand) 6%, var(--panel)); }
   .row.hidden{ display:none; }
   .row .pick{ width:18px; height:18px; accent-color:var(--brand); cursor:pointer; flex:none; }
   .thumb{ position:relative; flex:none; }
   .thumb img{ width:140px; height:79px; object-fit:cover; border-radius:9px; background:#000; display:block; }
-  .thumb .dur{
-    position:absolute; right:5px; bottom:5px; background:rgba(0,0,0,.82); color:#fff;
-    font-size:11px; padding:1px 6px; border-radius:5px; font-variant-numeric:tabular-nums;
-  }
+  .thumb .dur{ position:absolute; right:5px; bottom:5px; background:rgba(0,0,0,.82); color:#fff;
+    font-size:11px; padding:1px 6px; border-radius:5px; font-variant-numeric:tabular-nums; }
   .idx{ position:absolute; left:5px; top:5px; background:rgba(0,0,0,.7); color:#fff;
     font-size:10px; padding:1px 6px; border-radius:5px; }
   .info{ flex:1; min-width:0; }
@@ -377,24 +499,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .progress.busy > i{ background:linear-gradient(90deg,var(--brand),var(--accent));
     background-size:200% 100%; animation:flow 1.3s linear infinite; }
   @keyframes flow{ from{background-position:200% 0;} to{background-position:0 0;} }
-  .pill{
-    display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:600;
-    margin-top:7px; padding:2px 9px; border-radius:999px; background:var(--bg-soft); color:var(--muted);
-  }
+  .pill{ display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:600;
+    margin-top:7px; padding:2px 9px; border-radius:999px; background:var(--bg-soft); color:var(--muted); }
   .pill.done{ color:var(--ok); background:color-mix(in srgb,var(--ok) 14%, transparent); }
   .pill.error{ color:var(--err); background:color-mix(in srgb,var(--err) 14%, transparent); }
   .pill.downloading,.pill.merging{ color:var(--warn); background:color-mix(in srgb,var(--warn) 14%, transparent); }
   .pill.cancelled{ color:var(--faint); }
   .act{ flex:none; display:flex; flex-direction:column; gap:6px; align-items:flex-end; min-width:110px; }
+  /* In chapters mode the per-row download buttons & quality select don't apply. */
+  [data-mode="chapters"] .row .act{ display:none; }
+
+  /* Chapters result panel */
+  .result{ display:none; margin:6px 0 40px; background:var(--panel); border:1px solid var(--border);
+    border-radius:var(--radius); overflow:hidden; }
+  .result.show{ display:block; }
+  .result .rhead{ display:flex; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  .seg{ display:flex; gap:4px; background:var(--bg-soft); padding:4px; border-radius:9px; }
+  .seg button{ height:30px; padding:0 12px; font-size:12.5px; background:transparent; color:var(--muted); border:none; }
+  .seg button.on{ background:var(--panel); color:var(--text); }
+  .result textarea{ width:100%; min-height:300px; border:none; resize:vertical; padding:14px;
+    background:var(--bg); color:var(--text); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12.5px; line-height:1.6; outline:none; }
 
   /* States */
-  .err-box{
-    display:none; gap:10px; align-items:flex-start; padding:13px 15px; margin-bottom:14px;
+  .err-box{ display:none; gap:10px; align-items:flex-start; padding:13px 15px; margin-bottom:14px;
     background:color-mix(in srgb,var(--err) 10%, var(--panel)); border:1px solid color-mix(in srgb,var(--err) 35%, var(--border));
-    border-radius:var(--radius-sm); color:var(--text); font-size:13px; white-space:pre-wrap;
-  }
+    border-radius:var(--radius-sm); color:var(--text); font-size:13px; white-space:pre-wrap; }
   .err-box.show{ display:flex; }
-  .empty{ text-align:center; color:var(--muted); padding:70px 20px; }
+  .empty{ text-align:center; color:var(--muted); padding:60px 20px; }
   .empty .big{ font-size:46px; margin-bottom:10px; }
   .empty h2{ margin:0 0 6px; color:var(--text); font-size:18px; }
   .skeleton{ background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); height:103px; overflow:hidden; position:relative; }
@@ -405,11 +537,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   /* Toasts */
   #toasts{ position:fixed; right:18px; bottom:18px; display:flex; flex-direction:column; gap:8px; z-index:50; }
-  .toast{
-    background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--brand);
+  .toast{ background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--brand);
     padding:11px 15px; border-radius:10px; font-size:13px; box-shadow:var(--shadow);
-    animation:slidein .25s ease; max-width:320px;
-  }
+    animation:slidein .25s ease; max-width:320px; }
   .toast.ok{ border-left-color:var(--ok); }
   .toast.err{ border-left-color:var(--err); }
   @keyframes slidein{ from{ transform:translateY(10px); opacity:0; } }
@@ -419,31 +549,35 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   @media (max-width:620px){
     .thumb img{ width:104px; height:59px; }
-    .act{ min-width:96px; }
-    .pl-sub{ display:none; }
+    .act{ min-width:96px; } .pl-sub{ display:none; } .tab .t-sub{ display:none; }
   }
 </style>
 </head>
-<body>
+<body data-mode="download">
 <header>
   <div class="wrap head-row">
     <div class="logo">
-      <span class="mark">⬇</span>
-      <span>YouTube Playlist Downloader<small id="dirline">loading…</small></span>
+      <span class="mark">🧰</span>
+      <span>YouTube Playlist Toolkit<small>Download videos &amp; extract chapters — 100% local</small></span>
     </div>
     <span class="grow"></span>
-    <a class="ghost-link" href="https://github.com/" target="_blank" rel="noopener" id="ghlink">GitHub</a>
+    <a class="ghost-link" href="https://github.com/Saadnadeem07/youtube-playlist-chapters" target="_blank" rel="noopener">GitHub</a>
     <button class="icon-btn" id="theme" title="Toggle theme" type="button">🌙</button>
   </div>
 </header>
 
 <main class="wrap">
+  <div class="tabs">
+    <button class="tab active" data-tab="download" type="button">⬇ Download videos<span class="t-sub">save as mp4 / mp3</span></button>
+    <button class="tab" data-tab="chapters" type="button">📑 Extract chapters<span class="t-sub">one text file for LLMs</span></button>
+  </div>
+
   <div class="search">
     <div class="field">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
       <input id="url" type="text" placeholder="Paste a YouTube playlist or video URL…" autocomplete="off" spellcheck="false">
     </div>
-    <select id="quality" title="Download quality">
+    <select id="quality" class="only-download" title="Download quality">
       <option value="best">Best quality</option>
       <option value="1080">1080p</option>
       <option value="720">720p</option>
@@ -467,14 +601,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
         <input id="filter" type="text" placeholder="Filter…" autocomplete="off">
       </div>
-      <button class="secondary tiny" id="open" type="button">📁 Open folder</button>
-      <button class="tiny" id="dlsel" type="button" disabled>⬇ Download selected</button>
-      <button class="secondary tiny" id="dlall" type="button">Download all</button>
+      <button class="secondary tiny only-download" id="open" type="button">📁 Open folder</button>
+      <button class="tiny only-download" id="dlsel" type="button" disabled>⬇ Download selected</button>
+      <button class="secondary tiny only-download" id="dlall" type="button">Download all</button>
+      <button class="tiny only-chapters hide" id="chsel" type="button" disabled>📑 Extract selected</button>
+      <button class="secondary tiny only-chapters hide" id="chall" type="button">Extract all chapters</button>
     </div>
 
-    <div class="overall" id="overall">
+    <div class="strip only-download" id="overall">
       <div class="track"><i id="overall-bar"></i></div>
       <div class="label" id="overall-label"></div>
+    </div>
+    <div class="strip only-chapters hide" id="chstrip">
+      <div class="track"><i id="ch-bar"></i></div>
+      <div class="label" id="ch-label"></div>
+    </div>
+
+    <div class="result only-chapters hide" id="result">
+      <div class="rhead">
+        <div class="seg">
+          <button class="on" data-seg="output" type="button">📄 Output</button>
+          <button data-seg="prompt" type="button">🤖 LLM prompt</button>
+        </div>
+        <span class="grow"></span>
+        <button class="secondary tiny" id="copy" type="button">Copy</button>
+        <button class="tiny" id="savetxt" type="button">⬇ Download .txt</button>
+      </div>
+      <textarea id="out" readonly spellcheck="false" placeholder="Chapter output will appear here…"></textarea>
     </div>
 
     <div id="list"></div>
@@ -483,7 +636,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="empty" id="empty">
     <div class="big">🎬</div>
     <h2>Paste a playlist to get started</h2>
-    <div>Drop in any YouTube playlist or video link above and hit <b>Load</b>.</div>
+    <div>Switch between <b>Download</b> and <b>Chapters</b> above, drop in a YouTube link, and hit <b>Load</b>.</div>
   </div>
 </main>
 
@@ -493,7 +646,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 let videos = [];
+let mode = "download";
+let chaptersText = "";
+let chaptersPolling = false;
 const selected = new Set();
+const PROMPT = __PROMPT__;
 
 /* ---------- helpers ---------- */
 function fmtDur(s){
@@ -504,21 +661,27 @@ function fmtDur(s){
 }
 function escapeHtml(s){ return (s||"").replace(/[&<>"]/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
-
 function toast(msg, kind){
   const t = document.createElement("div");
-  t.className = "toast" + (kind?(" "+kind):"");
-  t.textContent = msg;
+  t.className = "toast" + (kind?(" "+kind):""); t.textContent = msg;
   $("#toasts").appendChild(t);
   setTimeout(()=>{ t.style.opacity="0"; t.style.transition="opacity .3s"; setTimeout(()=>t.remove(),300); }, 3200);
 }
-
 async function api(path, body){
   const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
                               body: JSON.stringify(body||{})});
   const data = await r.json();
   if(!r.ok || data.error) throw new Error(data.error || ("HTTP "+r.status));
   return data;
+}
+
+/* ---------- mode switching ---------- */
+function setMode(m){
+  mode = m; document.body.dataset.mode = m;
+  $$(".tab").forEach(t=> t.classList.toggle("active", t.dataset.tab===m));
+  $$(".only-download").forEach(el=> el.classList.toggle("hide", m!=="download"));
+  $$(".only-chapters").forEach(el=> el.classList.toggle("hide", m!=="chapters"));
+  try{ localStorage.setItem("ytk-mode", m); }catch(e){}
 }
 
 /* ---------- rendering ---------- */
@@ -538,14 +701,11 @@ function render(){
         <div class="title">${escapeHtml(v.title)}</div>
         <div class="by">${escapeHtml(v.uploader||"")}</div>
         <div class="progress"><i></i></div>
-        <div class="pill" data-state>queued</div>
+        <div class="pill" data-state>—</div>
       </div>
-      <div class="act">
-        <button class="tiny" data-dl="${v.id}">Download</button>
-      </div>`;
+      <div class="act"><button class="tiny" data-dl="${v.id}">Download</button></div>`;
     list.appendChild(row);
   });
-
   $$("[data-dl]").forEach(b=> b.onclick = ()=> enqueue([videos.find(v=>v.id===b.dataset.dl)]));
   $$("[data-pick]").forEach(c=> c.onchange = ()=>{
     const id = c.dataset.pick;
@@ -553,17 +713,17 @@ function render(){
     $("#v_"+id).classList.toggle("sel", c.checked);
     syncSelectUI();
   });
-  // Reset the per-row pill default text where nothing's been done yet.
-  $$("[data-state]").forEach(p=>{ p.textContent="—"; p.className="pill"; });
   applyFilter();
 }
 
 function syncSelectUI(){
-  $("#dlsel").disabled = selected.size===0;
-  $("#dlsel").textContent = selected.size ? `⬇ Download selected (${selected.size})` : "⬇ Download selected";
-  const visible = videos.length;
-  $("#selall").checked = selected.size>0 && selected.size===visible;
-  $("#selall").indeterminate = selected.size>0 && selected.size<visible;
+  const has = selected.size>0;
+  $("#dlsel").disabled = !has;
+  $("#chsel").disabled = !has;
+  $("#dlsel").textContent = has ? `⬇ Download selected (${selected.size})` : "⬇ Download selected";
+  $("#chsel").textContent = has ? `📑 Extract selected (${selected.size})` : "📑 Extract selected";
+  $("#selall").checked = has && selected.size===videos.length;
+  $("#selall").indeterminate = has && selected.size<videos.length;
 }
 
 function applyFilter(){
@@ -574,13 +734,14 @@ function applyFilter(){
   });
 }
 
-/* ---------- actions ---------- */
+/* ---------- load ---------- */
 async function load(){
   const url = $("#url").value.trim();
   if(!url){ toast("Paste a URL first", "err"); return; }
   $("#err").classList.remove("show");
   $("#empty").style.display = "none";
   $("#panel").hidden = false;
+  $("#result").classList.remove("show");
   $("#load").disabled = true;
   $("#load-txt").innerHTML = '<span class="spin">↻</span> Loading';
   $("#list").innerHTML = Array.from({length:4}, ()=> '<div class="skeleton"></div>').join("");
@@ -593,9 +754,7 @@ async function load(){
     $("#pl-sub").textContent = `${videos.length} video${videos.length===1?"":"s"}`;
     if(!videos.length){
       $("#list").innerHTML = `<div class="empty"><div class="big">🤷</div><h2>No videos found</h2></div>`;
-    } else {
-      render();
-    }
+    } else { render(); }
     syncSelectUI();
     toast(`Loaded ${videos.length} video${videos.length===1?"":"s"}`, "ok");
   }catch(e){
@@ -606,6 +765,7 @@ async function load(){
   }
 }
 
+/* ---------- download ---------- */
 async function enqueue(vs){
   vs = (vs||[]).filter(Boolean);
   if(!vs.length) return;
@@ -613,8 +773,6 @@ async function enqueue(vs){
   vs.forEach(v=>{
     const p = document.querySelector("#v_"+v.id+" [data-state]");
     if(p){ p.textContent="queued"; p.className="pill"; }
-    const btn = document.querySelector("#v_"+v.id+" [data-dl]");
-    if(btn) btn.disabled = true;
   });
   try{
     await api("/api/download", {format: fmt, videos: vs.map(v=>({id:v.id,title:v.title,url:v.url}))});
@@ -622,13 +780,10 @@ async function enqueue(vs){
     $("#overall").classList.add("show");
   }catch(e){ toast("Failed to queue: "+e.message, "err"); }
 }
-
 async function cancel(id){
   try{ await api("/api/cancel", {id}); toast("Cancelled", ""); }
   catch(e){ toast("Cancel failed: "+e.message, "err"); }
 }
-
-/* ---------- polling ---------- */
 function updateOverall(status){
   const states = videos.map(v=> status[v.id]?.state).filter(Boolean);
   const active = states.filter(s=>["queued","downloading","merging"].includes(s)).length;
@@ -637,22 +792,17 @@ function updateOverall(status){
   if(total===0){ $("#overall").classList.remove("show"); return; }
   $("#overall").classList.add("show");
   $("#overall-bar").style.width = (done/total*100) + "%";
-  $("#overall-label").textContent =
-    active>0 ? `${done}/${total} done · ${active} in progress`
-             : `${done}/${total} done`;
+  $("#overall-label").textContent = active>0 ? `${done}/${total} done · ${active} in progress` : `${done}/${total} done`;
 }
-
-async function poll(){
+async function pollDownloads(){
   try{
     const data = await api("/api/status", {});
     const status = data.status || {};
     Object.values(status).forEach(s=>{
       const row = document.querySelector("#v_"+s.vid); if(!row) return;
-      const bar = row.querySelector(".progress > i");
-      const prog = row.querySelector(".progress");
+      const bar = row.querySelector(".progress > i"), prog = row.querySelector(".progress");
       bar.style.width = (s.percent||0) + "%";
       prog.classList.toggle("busy", s.state==="downloading" || s.state==="merging");
-
       const pill = row.querySelector("[data-state]");
       let txt = s.state;
       if(s.state==="downloading") txt = `↓ ${Math.round(s.percent||0)}% · ${s.speed||""} · ETA ${s.eta||""}`;
@@ -662,7 +812,6 @@ async function poll(){
       else if(s.state==="cancelled") txt = "cancelled";
       else if(s.state==="queued") txt = "• queued";
       pill.textContent = txt; pill.className = "pill " + s.state;
-
       const busy = ["downloading","merging","queued"].includes(s.state);
       const act = row.querySelector(".act");
       if(busy){
@@ -675,19 +824,67 @@ async function poll(){
       }
     });
     updateOverall(status);
-  }catch(e){ /* ignore transient poll errors */ }
+  }catch(e){}
+}
+
+/* ---------- chapters ---------- */
+async function extract(vs){
+  vs = (vs||[]).filter(Boolean);
+  if(!vs.length){ toast("Nothing to extract", "err"); return; }
+  $("#result").classList.remove("show");
+  $("#chstrip").classList.add("show");
+  $("#ch-bar").style.width = "0%"; $("#ch-label").textContent = `0/${vs.length}`;
+  vs.forEach(v=>{ const p=document.querySelector("#v_"+v.id+" [data-state]");
+                  if(p){ p.textContent="• queued"; p.className="pill"; } });
+  try{
+    await api("/api/chapters/start", {videos: vs.map(v=>({id:v.id,title:v.title,url:v.url}))});
+    chaptersPolling = true;
+    toast(`Extracting chapters for ${vs.length} video${vs.length===1?"":"s"}…`, "ok");
+  }catch(e){ toast("Failed: "+e.message, "err"); $("#chstrip").classList.remove("show"); }
+}
+async function pollChapters(){
+  if(!chaptersPolling) return;
+  try{
+    const d = await api("/api/chapters/status", {});
+    $("#ch-bar").style.width = (d.total? d.done/d.total*100 : 0) + "%";
+    $("#ch-label").textContent = `${d.done}/${d.total} extracted`;
+    Object.entries(d.rows||{}).forEach(([id,info])=>{
+      const p = document.querySelector("#v_"+id+" [data-state]"); if(!p) return;
+      if(info.count>0){ p.textContent = `✓ ${info.count} chapters`; p.className="pill done"; }
+      else { p.textContent = "no chapters"; p.className="pill"; }
+    });
+    if(d.state==="done"){
+      chaptersPolling = false; chaptersText = d.text || "";
+      $("#chstrip").classList.remove("show");
+      $("#result").classList.add("show");
+      showSeg("output");
+      toast("Chapters ready ✓", "ok");
+    } else if(d.state==="error"){
+      chaptersPolling = false; $("#chstrip").classList.remove("show");
+      toast("Extraction failed: "+(d.error||""), "err");
+    }
+  }catch(e){}
+}
+function showSeg(which){
+  $$("[data-seg]").forEach(b=> b.classList.toggle("on", b.dataset.seg===which));
+  $("#out").value = which==="prompt" ? PROMPT : chaptersText;
+  $("#out").readOnly = which!=="output" ? true : true;
 }
 
 /* ---------- theme ---------- */
 function setTheme(t){
   document.documentElement.setAttribute("data-theme", t);
   $("#theme").textContent = t==="light" ? "☀️" : "🌙";
-  try{ localStorage.setItem("ytdl-theme", t); }catch(e){}
+  try{ localStorage.setItem("ytk-theme", t); }catch(e){}
 }
 (function initTheme(){
-  let t; try{ t = localStorage.getItem("ytdl-theme"); }catch(e){}
+  let t; try{ t = localStorage.getItem("ytk-theme"); }catch(e){}
   if(!t) t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
   setTheme(t);
+})();
+(function initMode(){
+  let m; try{ m = localStorage.getItem("ytk-mode"); }catch(e){}
+  setMode(m==="chapters" ? "chapters" : "download");
 })();
 
 /* ---------- wire up ---------- */
@@ -695,20 +892,38 @@ $("#load").onclick = load;
 $("#url").addEventListener("keydown", e=>{ if(e.key==="Enter") load(); });
 $("#dlall").onclick = ()=> enqueue(videos);
 $("#dlsel").onclick = ()=> enqueue(videos.filter(v=>selected.has(v.id)));
+$("#chall").onclick = ()=> extract(videos);
+$("#chsel").onclick = ()=> extract(videos.filter(v=>selected.has(v.id)));
 $("#open").onclick = ()=> api("/api/open", {}).catch(()=> toast("Could not open folder","err"));
 $("#filter").addEventListener("input", applyFilter);
 $("#theme").onclick = ()=> setTheme(document.documentElement.getAttribute("data-theme")==="light"?"dark":"light");
+$$(".tab").forEach(t=> t.onclick = ()=> setMode(t.dataset.tab));
+$$("[data-seg]").forEach(b=> b.onclick = ()=> showSeg(b.dataset.seg));
+$("#copy").onclick = async ()=>{
+  try{ await navigator.clipboard.writeText($("#out").value); toast("Copied to clipboard", "ok"); }
+  catch(e){ toast("Copy failed", "err"); }
+};
+$("#savetxt").onclick = ()=>{
+  const isPrompt = document.querySelector('[data-seg="prompt"]').classList.contains("on");
+  const blob = new Blob([$("#out").value], {type:"text/plain"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = isPrompt ? "llm_prompt.txt" : "playlist_chapters.txt";
+  a.click(); URL.revokeObjectURL(a.href);
+};
 $("#selall").onchange = e=>{
   selected.clear();
   if(e.target.checked) videos.forEach(v=> selected.add(v.id));
   $$("[data-pick]").forEach(c=>{ c.checked = e.target.checked; $("#v_"+c.dataset.pick).classList.toggle("sel", e.target.checked); });
   syncSelectUI();
 };
-fetch("/api/info").then(r=>r.json()).then(d=>{ $("#dirline").textContent = "Saving to " + d.dir; });
-setInterval(poll, 1000);
+setInterval(()=>{ pollDownloads(); pollChapters(); }, 1000);
 </script>
 </body>
 </html>"""
+
+# Inject the LLM prompt template into the page as a JSON string literal.
+INDEX_HTML = INDEX_HTML.replace("__PROMPT__", json.dumps(LLM_PROMPT))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -772,6 +987,22 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/open":
                 open_folder()
                 self._json(200, {"ok": True})
+            elif self.path == "/api/chapters/start":
+                body = self._read_json()
+                vids = [v for v in body.get("videos", []) if v.get("id")]
+                if not vids:
+                    self._json(400, {"error": "No videos to extract."})
+                else:
+                    start_chapters(vids)
+                    self._json(200, {"ok": True})
+            elif self.path == "/api/chapters/status":
+                with _ch_lock:
+                    payload = {"state": _ch["state"], "done": _ch["done"],
+                               "total": _ch["total"], "rows": _ch["rows"],
+                               "error": _ch["error"]}
+                    if _ch["state"] == "done":
+                        payload["text"] = _ch["text"]
+                self._json(200, payload)
             else:
                 self._json(404, {"error": "not found"})
         except Exception as e:  # noqa: BLE001

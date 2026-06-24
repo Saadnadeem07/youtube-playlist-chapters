@@ -1,16 +1,16 @@
 [project]
-name = "yt-playlist-downloader"
-version = "1.0.0"
-description = "A tiny, dependency-free local web app to download YouTube playlists with a live UI."
+name = "youtube-playlist-toolkit"
+version = "2.0.0"
+description = "A tiny, dependency-free local web app to download YouTube playlists and extract video chapters."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.8"
 authors = [{ name = "Saad Nadeem" }]
-keywords = ["youtube", "yt-dlp", "downloader", "playlist", "ffmpeg"]
+keywords = ["youtube", "yt-dlp", "downloader", "playlist", "chapters", "ffmpeg", "llm"]
 
 [project.urls]
-Repository = "https://github.com/saadnadeem/yt-playlist-downloader"
-Issues = "https://github.com/saadnadeem/yt-playlist-downloader/issues"
+Repository = "https://github.com/Saadnadeem07/youtube-playlist-chapters"
+Issues = "https://github.com/Saadnadeem07/youtube-playlist-chapters/issues"
 
 [tool.ruff]
 line-length = 100

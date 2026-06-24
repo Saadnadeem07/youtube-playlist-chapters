@@ -2,7 +2,7 @@
 #
 # It does require two external command-line tools on your PATH:
 #
-#   yt-dlp   https://github.com/yt-dlp/yt-dlp   (the downloader)
+#   yt-dlp   https://github.com/yt-dlp/yt-dlp   (downloads + reads metadata/chapters)
 #   ffmpeg   https://ffmpeg.org/                (merges video + audio, makes mp3)
 #
 # Install them with your OS package manager, e.g.:

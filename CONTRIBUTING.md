@@ -1,14 +1,14 @@
 # Contributing
 
-Thanks for your interest in improving **YouTube Playlist Downloader**! 🎉
+Thanks for your interest in improving **YouTube Playlist Toolkit**! 🎉
 
 This is a small, single-file project, so contributing is intentionally simple.
 
 ## Getting set up
 
 ```bash
-git clone https://github.com/saadnadeem/yt-playlist-downloader.git
-cd yt-playlist-downloader
+git clone https://github.com/Saadnadeem07/youtube-playlist-chapters.git
+cd youtube-playlist-chapters
 
 # External tools (only these are required to run):
 brew install yt-dlp ffmpeg        # macOS — see README for Windows/Linux
@@ -30,8 +30,11 @@ There are **no Python dependencies** — the app uses only the standard library.
   ```bash
   pipx run ruff check .
   ```
-- Test the UI manually: load a playlist, download one video, download a
-  selection, cancel an in-progress download, and try the quality options.
+- Test both tools manually:
+  - **Download:** load a playlist, download one video, download a selection,
+    cancel an in-progress download, try the quality options.
+  - **Chapters:** extract all / selected, check the output and per-video counts,
+    copy and download the `.txt`, and view the LLM prompt.
 
 ## Commit & PR style
 
@@ -42,9 +45,9 @@ There are **no Python dependencies** — the app uses only the standard library.
 
 ## Reporting bugs / ideas
 
-Open an [issue](https://github.com/saadnadeem/yt-playlist-downloader/issues)
-using the templates. For download failures, include your `yt-dlp --version`
-and the exact URL/error where possible.
+Open an [issue](https://github.com/Saadnadeem07/youtube-playlist-chapters/issues)
+using the templates. For download/extraction failures, include your
+`yt-dlp --version` and the exact URL/error where possible.
 
 By contributing, you agree your contributions are licensed under the
 [MIT License](LICENSE).

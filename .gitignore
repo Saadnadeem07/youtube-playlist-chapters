@@ -8,6 +8,11 @@ downloads/
 *.part
 *.ytdl
 
+# Chapters tool output
+playlist_videos.txt
+final_output.txt
+playlist_chapters.txt
+
 # macOS / OS cruft
 .DS_Store
 Thumbs.db
