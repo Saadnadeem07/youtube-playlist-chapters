@@ -1,0 +1,14 @@
+# This app needs NO Python packages — it runs entirely on the standard library.
+#
+# It does require two external command-line tools on your PATH:
+#
+#   yt-dlp   https://github.com/yt-dlp/yt-dlp   (the downloader)
+#   ffmpeg   https://ffmpeg.org/                (merges video + audio, makes mp3)
+#
+# Install them with your OS package manager, e.g.:
+#   macOS:    brew install yt-dlp ffmpeg
+#   Windows:  winget install yt-dlp.yt-dlp Gyan.FFmpeg
+#   Linux:    sudo apt install yt-dlp ffmpeg     (or: pipx install yt-dlp)
+#
+# Prefer pip for yt-dlp? Uncomment the line below and run: pip install -r requirements.txt
+# yt-dlp>=2024.1.0

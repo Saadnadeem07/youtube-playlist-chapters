@@ -1,0 +1,51 @@
+name: 🐞 Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Paste this URL: ...
+        2. Click ...
+        3. See error ...
+    validations:
+      required: true
+  - type: input
+    id: ytdlp-version
+    attributes:
+      label: yt-dlp version
+      description: Output of `yt-dlp --version`
+      placeholder: "2024.xx.xx"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`
+      placeholder: "3.12.x"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console / error output
+      description: Paste any relevant output from the terminal or browser console.
+      render: shell
